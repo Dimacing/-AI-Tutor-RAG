@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AI Tutor RAG</title>
+    <link rel="stylesheet" href="/site/styles.css" />
+  </head>
+  <body>
+    <div class="page">
+      <header class="hero">
+        <div class="hero-copy">
+        <div class="badge">cloud.ru ai tutor</div>
+        <h1>AI Tutor RAG</h1>
+        <p>Задавайте вопросы по документации Cloud.ru, своим файлам или выбранному сайту.</p>
+        <div class="hero-actions">
+            <button class="ghost" id="refresh-health" type="button">Обновить статус</button>
+        </div>
+      </div>
+      <div class="hero-stats">
+        <label class="stat-card" style="--delay: 0.05s">
+          <span>Размер чанка</span>
+          <input id="param-chunk-size" type="number" min="200" max="4000" step="50" value="1200" />
+        </label>
+        <label class="stat-card" style="--delay: 0.1s">
+          <span>Перекрытие</span>
+          <input id="param-overlap" type="number" min="0" max="2000" step="25" value="200" />
+        </label>
+        <label class="stat-card" style="--delay: 0.15s">
+          <span>Top-K</span>
+          <input id="param-top-k" type="number" min="1" max="20" step="1" value="4" />
+        </label>
+        <label class="stat-card" style="--delay: 0.2s">
+          <span>Порог схожести</span>
+          <input id="param-min-score" type="number" min="0" max="1" step="0.05" value="0.2" />
+        </label>
+      </div>
+      </header>
+
+      <main class="workspace">
+        <aside class="controls">
+          <section class="card" style="--delay: 0.08s">
+            <h2>Режим</h2>
+            <div class="segmented" id="mode-buttons">
+              <button class="segmented-btn is-active" type="button" data-mode="cloud">
+                Документация
+              </button>
+              <button class="segmented-btn" type="button" data-mode="local">Мои файлы</button>
+              <button class="segmented-btn" type="button" data-mode="web">Сайт</button>
+            </div>
+
+            <div class="mode-panel is-active" data-panel="cloud">
+              <div class="status-row">
+                <span>Индекс Cloud</span>
+                <span class="status-pill" id="status-cloud">неизвестно</span>
+              </div>
+              <p class="hint" id="cloud-hint">
+                Сначала постройте эмбеддинги для этого режима.
+              </p>
+              <button class="primary" id="build-cloud" type="button">Создать индекс</button>
+              <div class="progress">
+                <div class="progress-bar" id="progress-cloud"></div>
+              </div>
+              <div class="progress-meta">
+                <span id="progress-cloud-label">0%</span>
+                <span id="progress-cloud-message"></span>
+              </div>
+            </div>
+
+            <div class="mode-panel" data-panel="local">
+              <div class="status-row">
+                <span>Локальный индекс</span>
+                <span class="status-pill" id="status-local">неизвестно</span>
+              </div>
+              <label class="field">
+                <span>Загрузите файлы (PDF, DOCX, TXT)</span>
+                <input id="local-files" type="file" multiple accept=".pdf,.docx,.txt" />
+              </label>
+              <button class="primary" id="build-local" type="button">Создать индекс</button>
+              <div class="progress">
+                <div class="progress-bar" id="progress-local"></div>
+              </div>
+              <div class="progress-meta">
+                <span id="progress-local-label">0%</span>
+                <span id="progress-local-message"></span>
+              </div>
+            </div>
+
+            <div class="mode-panel" data-panel="web">
+              <div class="status-row">
+                <span>Индекс сайта</span>
+                <span class="status-pill" id="status-web">неизвестно</span>
+              </div>
+              <label class="field">
+                <span>Ссылка на сайт</span>
+                <input id="web-url" type="text" placeholder="https://example.com/docs" />
+              </label>
+              <label class="field inline">
+                <input id="web-crawl" type="checkbox" checked />
+                <span>Сканировать ссылки на том же домене</span>
+              </label>
+              <label class="field">
+                <span>Фильтр пути (опционально)</span>
+                <input id="web-allowlist" type="text" placeholder="/docs/" />
+              </label>
+              <label class="field">
+                <span>Максимум страниц</span>
+                <input id="web-max-pages" type="number" min="1" max="200" value="30" />
+              </label>
+              <button class="primary" id="build-web" type="button">Создать индекс</button>
+              <div class="progress">
+                <div class="progress-bar" id="progress-web"></div>
+              </div>
+              <div class="progress-meta">
+                <span id="progress-web-label">0%</span>
+                <span id="progress-web-message"></span>
+              </div>
+            </div>
+          </section>
+
+          <section class="card" style="--delay: 0.12s">
+            <h2>Модель</h2>
+            <label class="field">
+              <span>Провайдер</span>
+              <select id="provider">
+                <option value="openai">openai</option>
+                <option value="gemini">gemini</option>
+                <option value="deepseek">deepseek</option>
+                <option value="ollama">ollama</option>
+                <option value="gigachat">gigachat</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Модель</span>
+              <input id="model" type="text" />
+            </label>
+            <label class="field">
+              <span>Модель эмбеддингов</span>
+              <select id="embedding-model"></select>
+            </label>
+          </section>
+        </aside>
+
+        <section class="chat">
+          <div class="card chat-card" style="--delay: 0.16s">
+            <div class="chat-header">
+              <div>
+                <h2>Диалог</h2>
+                <p>Задавайте технические вопросы и получайте ответы с источниками.</p>
+              </div>
+              <div class="status-pill neutral" id="chat-status">индекс не готов</div>
+            </div>
+            <div id="chat-log" class="chat-log"></div>
+            <form id="chat-form" class="chat-input">
+              <textarea
+                id="chat-input"
+                rows="1"
+                placeholder="Задайте вопрос по учебным материалам"
+              ></textarea>
+              <button class="primary" id="send-btn" type="submit">Отправить</button>
+            </form>
+          </div>
+        </section>
+      </main>
+
+      <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    </div>
+
+    <script src="/site/app.js"></script>
+  </body>
+</html>

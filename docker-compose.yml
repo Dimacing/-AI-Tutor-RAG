@@ -1,0 +1,36 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  streamlit:
+    build: .
+    profiles: ["streamlit"]
+    depends_on:
+      - api
+    command: streamlit run ui/streamlit_app.py --server.port=8501 --server.address=0.0.0.0
+    ports:
+      - "8501:8501"
+    env_file: .env
+    environment:
+      - BACKEND_URL=http://api:8000
+    volumes:
+      - ./data:/app/data
+
+  telegram_bot:
+    build: .
+    profiles: ["bot"]
+    depends_on:
+      - api
+    command: python -m backend.telegram_bot
+    env_file: .env
+    environment:
+      - BACKEND_URL=http://api:8000
+    volumes:
+      - ./data:/app/data
