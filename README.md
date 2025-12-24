@@ -1,4 +1,5 @@
 ﻿# AI Tutor RAG MVP
+<img width="2134" height="1210" alt="image" src="https://github.com/user-attachments/assets/99cd2f6d-885a-4655-832d-2c19ed4c24b7" />
 
 Минимальный MVP AI-репетитора на базе RAG (Retrieval-Augmented Generation).
 Система индексирует материалы, находит релевантные фрагменты и генерирует ответ с источниками, самопроверкой и тестом.
