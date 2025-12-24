@@ -99,13 +99,15 @@ def generate_answer(
 
     sources = _build_sources(retrieved)
     if strict_sources and not _has_overlap(question, sources):
-        return _no_answer_result()
+        if not _passes_vector_gate(retrieved):
+            return _no_answer_result()
 
     system_prompt = build_system_prompt()
     user_prompt = build_user_prompt(question, sources)
 
     model_output = ""
     parsed = None
+    answer_from_fallback = False
     try:
         model_output = llm.complete(system_prompt, user_prompt)
         parsed = _try_parse_json(model_output)
@@ -118,24 +120,33 @@ def generate_answer(
     recommended = _to_citations(sources)
 
     if parsed:
-        answer_text = parsed.get("answer", "")
-        self_check = parsed.get("self_check_question", "")
+        answer_text = _render_answer_payload(parsed.get("answer", ""), question)
+        self_check = _coerce_text(parsed.get("self_check_question", ""))
         recommended_items = parsed.get("recommended_resources", [])
+        if not isinstance(recommended_items, list):
+            recommended_items = []
         if strict_sources:
             recommended = _filter_recommended(recommended_items, sources) or recommended
         else:
             recommended = _from_resource_list(recommended_items) or recommended
+    else:
+        candidate = (model_output or "").strip()
+        if candidate and not _looks_like_json(candidate):
+            answer_text = candidate
+
+    if answer_text:
+        answer_text = _focus_answer_on_sql(answer_text, question)
 
     if strict_sources and llm is not None and answer_text:
-        if not _has_valid_citations(answer_text, len(sources)):
+        if not _is_grounded_answer(answer_text, sources):
             answer_text = ""
             self_check = ""
-        elif not _is_grounded_answer(answer_text, sources):
-            answer_text = ""
-            self_check = ""
+        else:
+            answer_text = _ensure_citations(answer_text, sources)
 
     if not answer_text:
         answer_text = _fallback_answer(sources)
+        answer_from_fallback = True
 
     if not self_check:
         self_check = (
@@ -144,11 +155,14 @@ def generate_answer(
             "\u043a\u043e\u0432 \u0432\u044b\u0448\u0435?"
         )
 
-    if strict_sources and not _answer_mentions_question(answer_text, question):
+    if strict_sources and not answer_from_fallback and not _answer_mentions_question(answer_text, question):
         return _no_answer_result()
 
     if strict_sources and not _is_grounded_answer(answer_text, sources):
         return _no_answer_result()
+
+    if answer_text:
+        answer_text = _renumber_lists(answer_text)
 
     if append_sources:
         answer_text = _append_sources(answer_text, _to_citations(sources))
@@ -220,6 +234,90 @@ def _from_resource_list(items: list[dict]) -> list[Citation]:
     return citations
 
 
+def _collapse_whitespace(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _dedupe_preserve_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        key = item.strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+    return result
+
+
+def _normalize_command(text: str) -> str:
+    cleaned = re.sub(r"\s+", " ", text).strip()
+    cleaned = re.sub(r"\s+([;:,)])", r"\1", cleaned)
+    cleaned = re.sub(r"\(\s+", "(", cleaned)
+    cleaned = re.sub(r"\s+\)", ")", cleaned)
+    return cleaned
+
+
+def _extract_sql_commands(text: str) -> list[str]:
+    collapsed = _collapse_whitespace(text)
+    patterns = [
+        r"CREATE DATABASE [^;]+?;?",
+        r"CREATE USER [^;]+?;?",
+        r"GRANT [^;]+?;?",
+        r"FLUSH PRIVILEGES\s*;?",
+        r"USE [^;]+?;?",
+        r"EXIT\s*;?",
+    ]
+    commands: list[str] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, collapsed, flags=re.IGNORECASE):
+            cmd = _normalize_command(match.group(0))
+            upper = cmd.upper()
+            if upper.startswith(("CREATE", "GRANT", "FLUSH", "USE", "EXIT")) and not cmd.endswith(";"):
+                cmd = f"{cmd};"
+            commands.append(cmd)
+    return _dedupe_preserve_order(commands)
+
+
+def _extract_shell_commands(text: str) -> list[str]:
+    collapsed = _collapse_whitespace(text)
+    patterns = [
+        r"(?:sudo\s+)?mysql\s+-u\s+\S+(?:\s+-p)?",
+    ]
+    commands: list[str] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, collapsed, flags=re.IGNORECASE):
+            cmd = _normalize_command(match.group(0))
+            commands.append(cmd)
+    return _dedupe_preserve_order(commands)
+
+
+def _collect_summary_sentences(
+    sources: list[SourceContext],
+    max_items: int = 3,
+) -> list[str]:
+    sentences: list[str] = []
+    seen: set[str] = set()
+    for source in sources:
+        for sentence in _split_sentences(source.text):
+            cleaned = _clean_text(sentence)
+            if len(cleaned) < 40:
+                continue
+            if len(cleaned) > 240:
+                cleaned = cleaned[:240].rstrip() + "..."
+            first = cleaned[0]
+            if first.isalpha() and first.islower():
+                continue
+            key = cleaned.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            sentences.append(cleaned)
+            if len(sentences) >= max_items:
+                return sentences
+    return sentences
+
+
 def _fallback_answer(sources: list[SourceContext]) -> str:
     if not sources:
         return (
@@ -228,22 +326,41 @@ def _fallback_answer(sources: list[SourceContext]) -> str:
             "\u0434\u043b\u044f \u043e\u0442\u0432\u0435\u0442\u0430 \u043d\u0430 \u0432"
             "\u043e\u043f\u0440\u043e\u0441."
         )
-    snippets: list[str] = []
-    for source in sources[:2]:
-        cleaned = _clean_text(source.text)
-        if not cleaned:
-            continue
-        sentences = _split_sentences(cleaned)
-        if sentences:
-            snippet = " ".join(sentences[:2])
-        else:
-            snippet = cleaned[:400]
-        if snippet:
-            snippets.append(snippet)
+    shell_commands: list[str] = []
+    sql_commands: list[str] = []
+    for source in sources[:3]:
+        shell_commands.extend(_extract_shell_commands(source.text))
+        sql_commands.extend(_extract_sql_commands(source.text))
+    shell_commands = _dedupe_preserve_order(shell_commands)
+    sql_commands = _dedupe_preserve_order(sql_commands)
+
+    parts: list[str] = []
+    if shell_commands:
+        parts.append("\u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u0435 \u043a MySQL:")
+        parts.append("```bash")
+        parts.extend(shell_commands)
+        parts.append("```")
+    if sql_commands:
+        parts.append("\u0421\u043e\u0437\u0434\u0430\u043d\u0438\u0435 \u0431\u0430\u0437\u044b \u0438 \u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u0435\u043b\u044f:")
+        parts.append("```sql")
+        parts.extend(sql_commands)
+        parts.append("```")
+
+    if parts:
+        return "\n".join(parts).strip()
+
+    summaries = _collect_summary_sentences(sources)
+    if summaries:
+        parts.append("\u041a\u0440\u0430\u0442\u043a\u043e \u043f\u043e \u0438\u0441\u0442\u043e\u0447\u043d\u0438\u043a\u0430\u043c:")
+        for sentence in summaries:
+            parts.append(f"- {sentence}")
+        return "\n".join(parts).strip()
     return (
         "\u041d\u0430 \u043e\u0441\u043d\u043e\u0432\u0435 \u0438\u0441\u0442\u043e"
-        "\u0447\u043d\u0438\u043a\u043e\u0432: "
-        + " ".join(snippets)
+        "\u0447\u043d\u0438\u043a\u043e\u0432 \u043d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c "
+        "\u043f\u043e\u0434\u0433\u043e\u0442\u043e\u0432\u0438\u0442\u044c "
+        "\u0441\u0442\u0440\u0443\u043a\u0442\u0443\u0440\u0438\u0440\u043e\u0432\u0430\u043d\u043d\u044b\u0439 "
+        "\u043e\u0442\u0432\u0435\u0442."
     )
 
 
@@ -263,11 +380,109 @@ def _try_parse_json(text: str) -> dict | None:
         return None
 
 
+def _looks_like_json(text: str) -> bool:
+    stripped = text.lstrip()
+    if stripped.startswith("```"):
+        stripped = stripped.strip("`").lstrip()
+    return stripped.startswith("{") and stripped.rstrip().endswith("}")
+
+
+def _coerce_text(value: object) -> str:
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    return ""
+
+
+def _render_answer_payload(value: object, question: str) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        steps = value.get("steps")
+        if isinstance(steps, list):
+            filtered = _filter_steps_for_question(question, steps)
+            return _render_steps(filtered)
+        text = value.get("text")
+        if isinstance(text, str):
+            return text
+        return ""
+    if isinstance(value, list):
+        if value and all(isinstance(item, dict) for item in value):
+            filtered = _filter_steps_for_question(question, value)
+            return _render_steps(filtered)
+        return "\n".join(_coerce_text(item) for item in value if _coerce_text(item))
+    return ""
+
+
+def _focus_answer_on_sql(answer: str, question: str) -> str:
+    if not _question_wants_sql_commands(question):
+        return answer
+
+    sql_block = _extract_code_block(answer, "sql", aliases=("mysql",))
+    sql_commands: list[str] = []
+    if not sql_block:
+        sql_commands = _extract_sql_commands(answer)
+        if sql_commands:
+            sql_block = "\n".join(sql_commands)
+
+    if not sql_block:
+        return answer
+    if sql_commands and not _has_create_or_grant(sql_commands):
+        return answer
+
+    mysql_cmd = _find_mysql_command(answer)
+    if not mysql_cmd:
+        shell_cmds = _extract_shell_commands(answer)
+        mysql_cmd = shell_cmds[0] if shell_cmds else ""
+
+    parts: list[str] = []
+    if mysql_cmd:
+        parts.append("\u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u0435 \u043a MySQL:")
+        parts.append("```bash")
+        parts.append(mysql_cmd)
+        parts.append("```")
+    parts.append("\u0421\u043e\u0437\u0434\u0430\u043d\u0438\u0435 \u0431\u0430\u0437\u044b \u0438 \u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u0435\u043b\u044f:")
+    parts.append("```sql")
+    parts.extend(sql_block.splitlines())
+    parts.append("```")
+    return "\n".join(parts).strip()
+
+
+def _extract_code_block(text: str, lang: str, aliases: tuple[str, ...] = ()) -> str:
+    for match in _CODE_BLOCK_RE.finditer(text or ""):
+        block_lang = (match.group(1) or "").lower()
+        content = match.group(2) or ""
+        if block_lang == lang or (aliases and block_lang in aliases):
+            return content.strip()
+        if not block_lang and lang == "sql" and _looks_like_sql_block(content):
+            return content.strip()
+    return ""
+
+
+def _find_mysql_command(text: str) -> str:
+    for match in _CODE_BLOCK_RE.finditer(text or ""):
+        content = match.group(2) or ""
+        for line in content.splitlines():
+            cleaned = _strip_list_prefix(line.strip())
+            if "mysql" in cleaned.lower() and cleaned.startswith(("sudo", "mysql")):
+                return cleaned
+    for line in (text or "").splitlines():
+        cleaned = _strip_list_prefix(line.strip())
+        if "mysql" in cleaned.lower() and cleaned.startswith(("sudo", "mysql")):
+            return cleaned
+    return ""
+
+
 _CITATION_RE = re.compile(r"\[(\d+)\]")
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 _NUMBER_RE = re.compile(r"\b\d{2,}(?:\.\d{1,2})?\b")
 _WORD_RAW_RE = re.compile(r"[A-Za-z\u0410-\u042f\u0430-\u044f\u0401\u0451]+")
 _WORD_RE = re.compile(r"[A-Za-z\u0410-\u042f\u0430-\u044f0-9_]+")
+_CODE_BLOCK_RE = re.compile(r"^[ \t]*```(\w+)?[ \t]*\r?\n(.*?)[ \t]*```", re.DOTALL | re.MULTILINE)
+_LIST_PREFIX_RE = re.compile(r"^\s*(?:\d+[.)]|[-*\u2022])\s+")
 _QUIZ_BLOCKLIST = {
     "\u0443\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u0435",
     "\u0443\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u044c",
@@ -385,6 +600,18 @@ def _has_valid_citations(text: str, max_id: int) -> bool:
         if 1 <= idx <= max_id:
             return True
     return False
+
+
+def _ensure_citations(answer: str, sources: list[SourceContext]) -> str:
+    if not answer or not sources:
+        return answer
+    if _has_valid_citations(answer, len(sources)):
+        return answer
+    suffix = f"[{sources[0].source_id}]"
+    trimmed = answer.rstrip()
+    if trimmed.endswith("```"):
+        return f"{trimmed}\n{suffix}"
+    return f"{trimmed} {suffix}"
 
 
 def _filter_recommended(
@@ -626,6 +853,187 @@ def _split_sentences(text: str) -> list[str]:
     return [s.strip() for s in _SENTENCE_SPLIT_RE.split(cleaned) if s.strip()]
 
 
+def _renumber_lists(text: str) -> str:
+    lines = text.splitlines()
+    out: list[str] = []
+    in_code_block = False
+    counter = 1
+    in_list = False
+    for line in lines:
+        stripped = line.lstrip()
+        if stripped.startswith("```"):
+            in_code_block = not in_code_block
+            out.append(line)
+            continue
+        if in_code_block:
+            out.append(line)
+            continue
+        if in_list and _is_bullet_line(stripped):
+            out.append(line)
+            continue
+        match = re.match(r"^(\d+)[.)]\s+", stripped)
+        if match:
+            content = stripped[match.end():]
+            if content:
+                prefix = line[: len(line) - len(stripped)]
+                out.append(f"{prefix}{counter}. {content}")
+                counter += 1
+                in_list = True
+            else:
+                out.append(line)
+            continue
+        if not stripped:
+            out.append(line)
+            continue
+        if in_list and (line.startswith(" ") or line.startswith("\t")):
+            out.append(line)
+            continue
+        if in_list:
+            counter = 1
+            in_list = False
+        out.append(line)
+    return "\n".join(out)
+
+
+def _render_steps(steps: list[dict]) -> str:
+    lines: list[str] = []
+    auto_step = 1
+    for item in steps:
+        if not isinstance(item, dict):
+            continue
+        step_value = item.get("step")
+        try:
+            step_num = int(step_value)
+        except (TypeError, ValueError):
+            step_num = auto_step
+        auto_step = step_num + 1
+
+        description = _coerce_text(item.get("description", "")).strip()
+        if description:
+            lines.append(f"{step_num}. {description}")
+        else:
+            lines.append(f"{step_num}.")
+
+        substeps = item.get("substeps")
+        if isinstance(substeps, list):
+            for sub in substeps:
+                text = _coerce_text(sub).strip()
+                if text:
+                    lines.append(f"- {text}")
+
+        commands = item.get("commands")
+        if isinstance(commands, list):
+            rendered = _render_commands(commands)
+            if rendered:
+                lines.append(rendered)
+
+    return "\n".join([line for line in lines if line]).strip()
+
+
+def _render_commands(commands: list[object]) -> str:
+    cleaned: list[str] = []
+    for cmd in commands:
+        text = _coerce_text(cmd).strip()
+        if not text:
+            continue
+        cleaned.append(text)
+    if not cleaned:
+        return ""
+
+    blocks: list[tuple[str, list[str]]] = []
+    current_lang = ""
+    current: list[str] = []
+    for cmd in cleaned:
+        lang = _command_lang(cmd)
+        if not current:
+            current_lang = lang
+            current.append(cmd)
+            continue
+        if lang != current_lang:
+            blocks.append((current_lang, current))
+            current_lang = lang
+            current = [cmd]
+        else:
+            current.append(cmd)
+    if current:
+        blocks.append((current_lang, current))
+
+    rendered: list[str] = []
+    for lang, cmds in blocks:
+        rendered.append(f"```{lang}")
+        rendered.extend(cmds)
+        rendered.append("```")
+    return "\n".join(rendered)
+
+
+def _command_lang(command: str) -> str:
+    upper = command.strip().upper()
+    if upper.startswith(("CREATE", "GRANT", "FLUSH", "USE", "EXIT")):
+        return "sql"
+    return "bash"
+
+
+def _filter_steps_for_question(question: str, steps: list[dict]) -> list[dict]:
+    if not _question_wants_sql_commands(question):
+        return steps
+
+    filtered: list[dict] = []
+    for item in steps:
+        if not isinstance(item, dict):
+            continue
+        commands = item.get("commands")
+        if isinstance(commands, list):
+            if any(_command_lang(_coerce_text(cmd)) == "sql" for cmd in commands):
+                filtered.append(item)
+                continue
+            if any("mysql" in _coerce_text(cmd).lower() for cmd in commands):
+                filtered.append(item)
+                continue
+
+    return filtered or steps
+
+
+def _question_wants_sql_commands(question: str) -> bool:
+    question_lower = (question or "").lower()
+    wants_db = any(
+        marker in question_lower
+        for marker in (
+            "mysql",
+            "sql",
+            "database",
+            "\u0431\u0430\u0437",
+            "\u0434\u0430\u043d\u043d",
+            "\u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u0435\u043b",
+            "user",
+            "wordpress",
+        )
+    )
+    wants_commands = any(
+        marker in question_lower for marker in ("\u043a\u043e\u043c\u0430\u043d\u0434", "command")
+    )
+    return wants_db and wants_commands
+
+
+def _looks_like_sql_block(text: str) -> bool:
+    return bool(re.search(r"\b(CREATE|GRANT|FLUSH|USE|EXIT)\b", text or "", re.IGNORECASE))
+
+
+def _strip_list_prefix(text: str) -> str:
+    return _LIST_PREFIX_RE.sub("", text)
+
+
+def _is_bullet_line(text: str) -> bool:
+    return bool(re.match(r"^[-*\u2022]\s+", text))
+
+
+def _has_create_or_grant(commands: list[str]) -> bool:
+    for cmd in commands:
+        upper = cmd.strip().upper()
+        if upper.startswith(("CREATE", "GRANT")):
+            return True
+    return False
+
+
 def _quiz_from_sentence(
     sentence: str,
     source_id: int,
@@ -854,6 +1262,16 @@ def _has_overlap(question: str, sources: list[SourceContext]) -> bool:
         return matched >= 2
     required = max(2, int(math.ceil(len(tokens) * 0.3)))
     return matched >= required
+
+
+def _passes_vector_gate(
+    retrieved: list[RetrievedChunk],
+    threshold: float = 0.3,
+) -> bool:
+    if not retrieved:
+        return False
+    top_score = max(item.score for item in retrieved)
+    return top_score >= threshold
 
 
 def _strip_citations(text: str) -> str:

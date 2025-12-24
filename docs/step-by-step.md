@@ -19,7 +19,7 @@
 
 5) Эмбеддинги и индекс
    - Постройте эмбеддинги через `sentence-transformers`.
-   - Сохраните эмбеддинги в `data/index/embeddings.npy`, чанки в `data/index/chunks.json`.
+   - Сохраните эмбеддинги в локальную векторную БД Qdrant (`data/index/qdrant`), чанки в `data/index/chunks.json`.
 
 6) Поиск
    - Эмбеддите запрос пользователя и вычислите косинусное сходство.

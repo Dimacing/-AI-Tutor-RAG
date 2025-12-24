@@ -6,6 +6,7 @@ beautifulsoup4
 lxml
 sentence-transformers
 numpy
+qdrant-client
 python-dotenv
 streamlit
 openai>=1.0.0

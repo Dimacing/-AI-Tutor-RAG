@@ -30,6 +30,6 @@ MVP представляет собой RAG-сервис с индексатор
 
 ## Поток данных
 1) Источники собираются в `data/sources.json`.
-2) `python -m backend.rag.index` строит `chunks.json` и `embeddings.npy`.
+2) `python -m backend.rag.index` строит `chunks.json` и векторный индекс Qdrant в `data/index/qdrant`.
 3) `/query` эмбеддит вопрос, извлекает топ чанки и вызывает LLM.
 4) Ответ включает текст, цитаты, самопроверку и рекомендации.

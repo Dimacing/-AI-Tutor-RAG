@@ -15,11 +15,14 @@ def build_system_prompt() -> str:
     return (
         "You are an AI tutor. Use only the provided sources. "
         "Explain clearly and simply. Do not invent facts. "
-        "If the sources describe a procedure or steps, reproduce ALL steps "
-        "in order without omitting sub-steps. Preserve numbering and structure. "
+        "If the sources describe a procedure or steps, reproduce the steps "
+        "that are relevant to the question in order without omitting sub-steps. "
+        "Do not include unrelated setup steps. Preserve order and hierarchy; "
+        "renumber sequentially if it improves clarity. "
         "Include commands, manifests, and configs in code blocks as written. "
         "Always include citations as [n] matching the sources. "
-        "Return JSON with keys: answer, self_check_question, recommended_resources."
+        "Return JSON only with keys: answer, self_check_question, recommended_resources. "
+        "The answer value must be a single string in Markdown."
     )
 
 
@@ -35,11 +38,12 @@ def build_user_prompt(question: str, sources: list[SourceContext]) -> str:
         "\nRequirements:\n"
         "- Answer in the same language as the question.\n"
         "- Use simple explanations, but do not summarize away steps.\n"
-        "- If sources contain steps, reproduce all of them in order.\n"
-        "- Keep numbered lists and bullet lists intact.\n"
+        "- If sources contain steps, include only those relevant to the question.\n"
+        "- Keep structure; renumber lists sequentially if needed for clarity.\n"
         "- Include commands, YAML, and code in fenced code blocks.\n"
         "- Include citations like [1], [2] for each factual claim.\n"
         "- Provide one self-check question.\n"
         "- Provide 1-3 recommended resources as title+url.\n"
+        "- Return JSON with answer as a Markdown string, not nested objects.\n"
     )
     return "\n".join(parts)
